@@ -1,0 +1,3 @@
+[submodule "lib/czds"]
+	path = lib/czds
+	url = https://github.com/WarrenUlrich/czds.git

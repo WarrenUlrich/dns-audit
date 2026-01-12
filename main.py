@@ -1,23 +1,55 @@
 #!/usr/bin/env python3
-import asyncio
-import os
-import gzip
-from datetime import datetime, timezone, timedelta
-from typing import Iterator, Tuple, List
+from __future__ import annotations
 
+import asyncio
+import gzip
+import os
+import mysql.connector
+
+from typing import (
+    Iterator,
+    Tuple,
+    List,
+    Set,
+    Optional,
+    TextIO,
+)
+
+from mysql.connector import MySQLConnection
 from czds import CZDS
 
-USERNAME = os.environ.get("CZDS_USERNAME")
-PASSWORD = os.environ.get("CZDS_PASSWORD")
+CZDS_USERNAME: Optional[str] = os.environ.get("CZDS_USERNAME")
+CZDS_PASSWORD: Optional[str] = os.environ.get("CZDS_PASSWORD")
 
-TARGET_TLDS = {"com", "net", "org"}
-ZONES_DIR = "zones"
-TIMESTAMP_FILE = os.path.join(ZONES_DIR, "timestamp")
-MAX_AGE = timedelta(days=7)
+MYSQL_HOST: Optional[str] = os.environ.get("MYSQL_HOST")
+MYSQL_USER: Optional[str] = os.environ.get("MYSQL_USER")
+MYSQL_PASSWORD: Optional[str] = os.environ.get("MYSQL_PASSWORD")
+MYSQL_DATABASE: Optional[str] = os.environ.get("MYSQL_DATABASE")
 
-MAX_CONCURRENT_DOWNLOADS = 3
+if not all(
+    [
+        CZDS_USERNAME,
+        CZDS_PASSWORD,
+        MYSQL_HOST,
+        MYSQL_USER,
+        MYSQL_PASSWORD,
+        MYSQL_DATABASE,
+    ]
+):
+    raise RuntimeError("Missing required environment variables")
 
-OUR_NS_DOMAINS = {
+MYSQL_CONFIG = {
+    "host": MYSQL_HOST,
+    "user": MYSQL_USER,
+    "password": MYSQL_PASSWORD,
+    "database": MYSQL_DATABASE,
+}
+
+TARGET_TLDS: Set[str] = {"com", "net", "org"}
+ZONES_DIR: str = "zones"
+MAX_CONCURRENT_DOWNLOADS: int = 3
+
+OUR_NS_DOMAINS: Set[str] = {
     "iinet.com",
     "easystreet.com",
     "nwlink.com",
@@ -29,120 +61,134 @@ OUR_NS_DOMAINS = {
     "inactive.net",
 }
 
+def get_mysql_connection() -> MySQLConnection:
+    return mysql.connector.connect(**MYSQL_CONFIG)
 
-def is_our_nameserver(ns: str) -> bool:
+
+def truncate_nshosted(conn: MySQLConnection) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute("TRUNCATE TABLE nshosted")
+    conn.commit()
+
+def insert_pairs(
+    conn: MySQLConnection,
+    pairs: List[Tuple[str, str]],
+) -> None:
+    if not pairs:
+        return
+
+    sql = """
+        INSERT IGNORE INTO nshosted (domain, hostname)
+        VALUES (%s, %s)
     """
-    Return True if the nameserver belongs to our infrastructure.
-    """
-    for allowed in OUR_NS_DOMAINS:
-        if ns.endswith(allowed):
+    with conn.cursor() as cursor:
+        cursor.executemany(sql, pairs)
+    conn.commit()
+
+
+def is_our_nameserver(nameserver: str) -> bool:
+    if "europa" in nameserver:
+        return False
+
+    for suffix in OUR_NS_DOMAINS:
+        if nameserver.endswith(suffix):
             return True
-
     return False
 
-
-def open_zone(path: str):
+def open_zone(path: str) -> TextIO:
     if path.endswith(".gz"):
-        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
-    return open(path, "r", encoding="utf-8", errors="replace")
-
-
-def downloads_needed() -> bool:
-    try:
-        with open(TIMESTAMP_FILE, "r", encoding="utf-8") as f:
-            last_run = datetime.fromisoformat(f.readline().strip())
-    except Exception:
-        return True
-
-    return (datetime.now(timezone.utc) - last_run) >= MAX_AGE
-
+        return gzip.open(path, mode="rt", encoding="utf-8", errors="replace")
+    return open(path, mode="r", encoding="utf-8", errors="replace")
 
 def iter_domain_pairs(path: str) -> Iterator[Tuple[str, str]]:
-    """
-    Stream (domain, nameserver) pairs from a zone file.
-    Only NS records are parsed.
-    """
-    with open_zone(path) as fh:
-        for line in fh:
+    with open_zone(path) as file:
+        for line in file:
             if not line or line[0] == ";":
                 continue
 
-            parts = line.split()
+            parts: List[str] = line.split()
             if len(parts) < 5:
                 continue
 
             if parts[3].upper() != "NS":
                 continue
 
-            domain = parts[0].rstrip(".").lower()
-            nameserver = parts[4].rstrip(".").lower()
+            domain: str = parts[0].rstrip(".").lower()
+            nameserver: str = parts[4].rstrip(".").lower()
 
             yield domain, nameserver
 
+async def process_zones(
+    ready_event: asyncio.Event,
+    files: List[str],
+) -> None:
+    await ready_event.wait()
 
-async def process_zones(done: asyncio.Event, files: List[str]):
-    await done.wait()
+    conn: MySQLConnection = get_mysql_connection()
+    try:
+        print("Clearing nshosted table")
+        truncate_nshosted(conn)
 
-    for path in files:
-        print(f"\nProcessing: {path}")
+        for path in files:
+            print(f"\nProcessing: {path}")
 
-        count = 0
-        sample = []
+            batch: List[Tuple[str, str]] = []
 
-        for src, dst in iter_domain_pairs(path):
-            if not is_our_nameserver(dst):
-                continue
+            for domain, nameserver in iter_domain_pairs(path):
+                if not is_our_nameserver(nameserver):
+                    continue
 
-            count += 1
+                batch.append((domain, nameserver))
 
-            if len(sample) < 10:
-                sample.append((src, dst))
+                if len(batch) >= 10_000:
+                    insert_pairs(conn, batch)
+                    batch.clear()
 
-        print(f"  Parsed {count:,} domain pairs")
-        for pair in sample:
-            print(" ", pair)
+            if batch:
+                insert_pairs(conn, batch)
 
+            try:
+                os.remove(path)
+                print(f"Deleted: {path}")
+            except OSError as exc:
+                print(f"Failed to delete {path}: {exc}")
 
-async def main():
-    if not USERNAME or not PASSWORD:
-        raise RuntimeError("CZDS credentials must be set via environment variables")
+    finally:
+        conn.close()
 
+async def main() -> None:
     os.makedirs(ZONES_DIR, exist_ok=True)
 
-    done_event = asyncio.Event()
+    ready_event: asyncio.Event = asyncio.Event()
     downloaded_files: List[str] = []
 
-    processor = asyncio.create_task(process_zones(done_event, downloaded_files))
+    processor_task: asyncio.Task[None] = asyncio.create_task(
+        process_zones(ready_event, downloaded_files)
+    )
 
-    if downloads_needed():
-        async with CZDS(USERNAME, PASSWORD) as client:
-            zone_links = await client.fetch_zone_links()
+    async with CZDS(CZDS_USERNAME, CZDS_PASSWORD) as client:
+        zone_links: List[str] = await client.fetch_zone_links()
 
-            targets = [
-                url
-                for url in zone_links
-                if url.split("/")[-1].split(".")[0].lower() in TARGET_TLDS
-            ]
+        targets: List[str] = [
+            url
+            for url in zone_links
+            if url.split("/")[-1].split(".")[0].lower() in TARGET_TLDS
+        ]
 
-            semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+        semaphore: asyncio.Semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-            async def download(url: str):
-                path = await client.download_zone(url, ZONES_DIR, semaphore)
-                downloaded_files.append(path)
+        async def download(url: str) -> None:
+            path: str = await client.download_zone(
+                url,
+                ZONES_DIR,
+                semaphore,
+            )
+            downloaded_files.append(path)
 
-            await asyncio.gather(*(download(url) for url in targets))
+        await asyncio.gather(*(download(url) for url in targets))
 
-            with open(TIMESTAMP_FILE, "w", encoding="utf-8") as f:
-                f.write(datetime.now(timezone.utc).isoformat() + "\n")
-    else:
-        for fname in os.listdir(ZONES_DIR):
-            if fname.endswith(".gz"):
-                downloaded_files.append(os.path.join(ZONES_DIR, fname))
-
-    done_event.set()
-    await processor
-
-    print("\nDone.")
+    ready_event.set()
+    await processor_task
 
 
 if __name__ == "__main__":

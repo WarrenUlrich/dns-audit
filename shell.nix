@@ -7,6 +7,7 @@ pkgs.mkShell {
   buildInputs = [
     python
     python.pkgs.tqdm
+    python.pkgs.mysql-connector
     python.pkgs.pip
     pkgs.git
   ];

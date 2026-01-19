@@ -141,9 +141,22 @@ def get_mysql_connection(mysql_cfg: MySQLConfig) -> MySQLConnection:
     )
 
 
-def truncate_nshosted(conn: MySQLConnection) -> None:
+def rebuild_nshosted(conn: MySQLConnection) -> None:
+    ddl = """
+    DROP TABLE IF EXISTS nshosted;
+    CREATE TABLE nshosted (
+        domain       VARCHAR(255) NOT NULL,
+        hostname     VARCHAR(255) NOT NULL,
+        customer_id  INT UNSIGNED NULL,
+
+        PRIMARY KEY (domain, hostname),
+        KEY idx_customer_id (customer_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    """
     with conn.cursor() as cursor:
-        cursor.execute("TRUNCATE TABLE nshosted")
+        for stmt in ddl.strip().split(";"):
+            if stmt.strip():
+                cursor.execute(stmt)
     conn.commit()
 
 
@@ -209,7 +222,7 @@ async def process_zones(
     conn: MySQLConnection = get_mysql_connection(mysql_cfg)
     try:
         print("Clearing nshosted table")
-        truncate_nshosted(conn)
+        rebuild_nshosted(conn)
 
         for path in files:
             print(f"\nProcessing: {path}")

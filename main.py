@@ -4,8 +4,13 @@ from __future__ import annotations
 import asyncio
 import gzip
 import os
+import requests
+import urllib3
+import xml.etree.ElementTree as ET
 import mysql.connector
+import tomllib
 
+from dataclasses import dataclass
 from typing import (
     Iterator,
     Tuple,
@@ -13,37 +18,50 @@ from typing import (
     Set,
     Optional,
     TextIO,
+    Dict,
 )
 
 from mysql.connector import MySQLConnection
 from czds import CZDS
 
-CZDS_USERNAME: Optional[str] = os.environ.get("CZDS_USERNAME")
-CZDS_PASSWORD: Optional[str] = os.environ.get("CZDS_PASSWORD")
+@dataclass(frozen=True)
+class CZDSConfig:
+    username: str
+    password: str
 
-MYSQL_HOST: Optional[str] = os.environ.get("MYSQL_HOST")
-MYSQL_USER: Optional[str] = os.environ.get("MYSQL_USER")
-MYSQL_PASSWORD: Optional[str] = os.environ.get("MYSQL_PASSWORD")
-MYSQL_DATABASE: Optional[str] = os.environ.get("MYSQL_DATABASE")
 
-if not all(
-    [
-        CZDS_USERNAME,
-        CZDS_PASSWORD,
-        MYSQL_HOST,
-        MYSQL_USER,
-        MYSQL_PASSWORD,
-        MYSQL_DATABASE,
-    ]
-):
-    raise RuntimeError("Missing required environment variables")
+@dataclass(frozen=True)
+class MySQLConfig:
+    host: str
+    user: str
+    password: str
+    database: str
 
-MYSQL_CONFIG = {
-    "host": MYSQL_HOST,
-    "user": MYSQL_USER,
-    "password": MYSQL_PASSWORD,
-    "database": MYSQL_DATABASE,
-}
+
+@dataclass(frozen=True)
+class PlatConfig:
+    url: str
+    username: str
+    password: str
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    czds: CZDSConfig
+    mysql: MySQLConfig
+    plat: PlatConfig
+
+
+def load_config(path: str = "/etc/zone-loader/config.toml") -> AppConfig:
+    with open(path, "rb") as f:
+        raw = tomllib.load(f)
+
+    return AppConfig(
+        czds=CZDSConfig(**raw["czds"]),
+        mysql=MySQLConfig(**raw["mysql"]),
+        plat=PlatConfig(**raw["plat"]),
+    )
+
 
 TARGET_TLDS: Set[str] = {"com", "net", "org"}
 ZONES_DIR: str = "zones"
@@ -61,8 +79,63 @@ OUR_NS_DOMAINS: Set[str] = {
     "inactive.net",
 }
 
-def get_mysql_connection() -> MySQLConnection:
-    return mysql.connector.connect(**MYSQL_CONFIG)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+def fetch_domain_customer_map(plat: PlatConfig) -> Dict[str, str]:
+    xml_payload = f"""<?xml version="1.0"?>
+    <PLATXML>
+        <header></header>
+        <body>
+            <data_block>
+                <protocol>Plat</protocol>
+                <object>addusr</object>
+                <action>SQL</action>
+                <username>{plat.username}</username>
+                <password>{plat.password}</password>
+                <logintype>staff</logintype>
+                <parameters>
+                    <query>
+                        SELECT domain, d_custid
+                        FROM domain_dns
+                        WHERE (d_active='Y' OR d_active='H')
+                    </query>
+                </parameters>
+            </data_block>
+        </body>
+    </PLATXML>
+    """
+
+    response = requests.post(
+        plat.url,
+        data=xml_payload,
+        headers={"Content-Type": "application/xml"},
+        verify=False,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    root = ET.fromstring(response.text)
+    attributes = root.find("./body/data_block/attributes")
+
+    domain_map: Dict[str, str] = {}
+
+    if attributes is not None:
+        for block in attributes.findall("data_block"):
+            record = {child.tag: child.text for child in block}
+            domain = record.get("domain")
+            custid = record.get("d_custid")
+            if domain and custid:
+                domain_map[domain.lower()] = custid
+
+    return domain_map
+
+def get_mysql_connection(mysql_cfg: MySQLConfig) -> MySQLConnection:
+    return mysql.connector.connect(
+        host=mysql_cfg.host,
+        user=mysql_cfg.user,
+        password=mysql_cfg.password,
+        database=mysql_cfg.database,
+    )
 
 
 def truncate_nshosted(conn: MySQLConnection) -> None:
@@ -70,16 +143,17 @@ def truncate_nshosted(conn: MySQLConnection) -> None:
         cursor.execute("TRUNCATE TABLE nshosted")
     conn.commit()
 
+
 def insert_pairs(
     conn: MySQLConnection,
-    pairs: List[Tuple[str, str]],
+    pairs: List[Tuple[str, str, Optional[str]]],
 ) -> None:
     if not pairs:
         return
 
     sql = """
-        INSERT IGNORE INTO nshosted (domain, hostname)
-        VALUES (%s, %s)
+        INSERT IGNORE INTO nshosted (domain, hostname, customer_id)
+        VALUES (%s, %s, %s)
     """
     with conn.cursor() as cursor:
         cursor.executemany(sql, pairs)
@@ -95,15 +169,17 @@ def is_our_nameserver(nameserver: str) -> bool:
             return True
     return False
 
+
 def open_zone(path: str) -> TextIO:
     if path.endswith(".gz"):
         return gzip.open(path, mode="rt", encoding="utf-8", errors="replace")
     return open(path, mode="r", encoding="utf-8", errors="replace")
 
+
 def iter_domain_pairs(path: str) -> Iterator[Tuple[str, str]]:
     with open_zone(path) as file:
         for line in file:
-            if not line or line[0] == ";":
+            if not line or line.startswith(";"):
                 continue
 
             parts: List[str] = line.split()
@@ -118,13 +194,16 @@ def iter_domain_pairs(path: str) -> Iterator[Tuple[str, str]]:
 
             yield domain, nameserver
 
+
 async def process_zones(
     ready_event: asyncio.Event,
     files: List[str],
+    domain_customer_map: Dict[str, str],
+    mysql_cfg: MySQLConfig,
 ) -> None:
     await ready_event.wait()
 
-    conn: MySQLConnection = get_mysql_connection()
+    conn: MySQLConnection = get_mysql_connection(mysql_cfg)
     try:
         print("Clearing nshosted table")
         truncate_nshosted(conn)
@@ -132,13 +211,14 @@ async def process_zones(
         for path in files:
             print(f"\nProcessing: {path}")
 
-            batch: List[Tuple[str, str]] = []
+            batch: List[Tuple[str, str, Optional[str]]] = []
 
             for domain, nameserver in iter_domain_pairs(path):
                 if not is_our_nameserver(nameserver):
                     continue
 
-                batch.append((domain, nameserver))
+                customer_id = domain_customer_map.get(domain)
+                batch.append((domain, nameserver, customer_id))
 
                 if len(batch) >= 10_000:
                     insert_pairs(conn, batch)
@@ -157,16 +237,27 @@ async def process_zones(
         conn.close()
 
 async def main() -> None:
+    config: AppConfig = load_config()
+
     os.makedirs(ZONES_DIR, exist_ok=True)
+
+    print("Loading domain → customer ID mapping")
+    domain_customer_map = fetch_domain_customer_map(config.plat)
+    print(f"Loaded {len(domain_customer_map)} domain mappings")
 
     ready_event: asyncio.Event = asyncio.Event()
     downloaded_files: List[str] = []
 
     processor_task: asyncio.Task[None] = asyncio.create_task(
-        process_zones(ready_event, downloaded_files)
+        process_zones(
+            ready_event,
+            downloaded_files,
+            domain_customer_map,
+            config.mysql,
+        )
     )
 
-    async with CZDS(CZDS_USERNAME, CZDS_PASSWORD) as client:
+    async with CZDS(config.czds.username, config.czds.password) as client:
         zone_links: List[str] = await client.fetch_zone_links()
 
         targets: List[str] = [
@@ -189,7 +280,6 @@ async def main() -> None:
 
     ready_event.set()
     await processor_task
-
 
 if __name__ == "__main__":
     asyncio.run(main())

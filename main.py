@@ -8,7 +8,7 @@ import requests
 import urllib3
 import xml.etree.ElementTree as ET
 import mysql.connector
-import tomllib
+import json
 
 from dataclasses import dataclass
 from typing import (
@@ -23,6 +23,7 @@ from typing import (
 
 from mysql.connector import MySQLConnection
 from czds import CZDS
+
 
 @dataclass(frozen=True)
 class CZDSConfig:
@@ -52,9 +53,9 @@ class AppConfig:
     plat: PlatConfig
 
 
-def load_config(path: str = "/etc/dns-audit/config.toml") -> AppConfig:
-    with open(path, "rb") as f:
-        raw = tomllib.load(f)
+def load_config(path: str = "/etc/dns-audit/config.json") -> AppConfig:
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
 
     return AppConfig(
         czds=CZDSConfig(**raw["czds"]),
@@ -80,6 +81,7 @@ OUR_NS_DOMAINS: Set[str] = {
 }
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 
 def fetch_domain_customer_map(plat: PlatConfig) -> Dict[str, str]:
     xml_payload = f"""<?xml version="1.0"?>
@@ -128,6 +130,7 @@ def fetch_domain_customer_map(plat: PlatConfig) -> Dict[str, str]:
                 domain_map[domain.lower()] = custid
 
     return domain_map
+
 
 def get_mysql_connection(mysql_cfg: MySQLConfig) -> MySQLConnection:
     return mysql.connector.connect(
@@ -236,6 +239,7 @@ async def process_zones(
     finally:
         conn.close()
 
+
 async def main() -> None:
     config: AppConfig = load_config()
 
@@ -280,6 +284,7 @@ async def main() -> None:
 
     ready_event.set()
     await processor_task
+
 
 if __name__ == "__main__":
     asyncio.run(main())

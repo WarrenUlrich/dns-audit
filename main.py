@@ -52,7 +52,7 @@ class AppConfig:
     plat: PlatConfig
 
 
-def load_config(path: str = "/etc/zone-loader/config.toml") -> AppConfig:
+def load_config(path: str = "/etc/dns-audit/config.toml") -> AppConfig:
     with open(path, "rb") as f:
         raw = tomllib.load(f)
 

@@ -250,8 +250,50 @@ async def process_zones(
                 print(f"Failed to delete {path}: {exc}")
 
     finally:
+        print_nshosted_summary(conn)
         conn.close()
 
+
+def print_nshosted_summary(conn: MySQLConnection, limit: int = 20) -> None:
+    with conn.cursor(dictionary=True) as cursor:
+        cursor.execute("SELECT COUNT(*) AS total FROM nshosted")
+        total = cursor.fetchone()["total"]
+
+        cursor.execute(
+            """
+            SELECT
+                COUNT(DISTINCT domain)   AS domains,
+                COUNT(DISTINCT hostname) AS hostnames,
+                COUNT(customer_id)       AS with_customer,
+                COUNT(*) - COUNT(customer_id) AS without_customer
+            FROM nshosted
+        """
+        )
+        stats = cursor.fetchone()
+
+        print("\n=== nshosted summary ===")
+        print(f"Total rows:        {total}")
+        print(f"Unique domains:    {stats['domains']}")
+        print(f"Unique hostnames:  {stats['hostnames']}")
+        print(f"With customer_id:  {stats['with_customer']}")
+        print(f"Without customer:  {stats['without_customer']}")
+
+        print("\nSample rows:")
+        cursor.execute(
+            """
+            SELECT domain, hostname, customer_id
+            FROM nshosted
+            ORDER BY domain, hostname
+            LIMIT %s
+        """,
+            (limit,),
+        )
+        for row in cursor.fetchall():
+            print(
+                f"{row['domain']:<35} "
+                f"{row['hostname']:<30} "
+                f"{row['customer_id']}"
+            )
 
 async def main() -> None:
     config: AppConfig = load_config()

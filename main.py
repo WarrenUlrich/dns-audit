@@ -83,7 +83,13 @@ OUR_NS_DOMAINS: Set[str] = {
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
-def fetch_domain_customer_map(plat: PlatConfig) -> Dict[str, str]:
+def fetch_domain_customer_map(
+    plat: PlatConfig,
+) -> Dict[str, Tuple[str, str]]:
+    """
+    Returns:
+        domain -> (customer_id, customer_email)
+    """
     xml_payload = f"""<?xml version="1.0"?>
     <PLATXML>
         <header></header>
@@ -97,9 +103,13 @@ def fetch_domain_customer_map(plat: PlatConfig) -> Dict[str, str]:
                 <logintype>staff</logintype>
                 <parameters>
                     <query>
-                        SELECT domain, d_custid
-                        FROM domain_dns
-                        WHERE (d_active='Y' OR d_active='H')
+                        SELECT
+                            c.id,
+                            d.domain,
+                            c.email
+                        FROM domain_dns d
+                        INNER JOIN customer c
+                            ON c.id = d.d_custid
                     </query>
                 </parameters>
             </data_block>
@@ -119,15 +129,17 @@ def fetch_domain_customer_map(plat: PlatConfig) -> Dict[str, str]:
     root = ET.fromstring(response.text)
     attributes = root.find("./body/data_block/attributes")
 
-    domain_map: Dict[str, str] = {}
+    domain_map: Dict[str, Tuple[str, str]] = {}
 
     if attributes is not None:
         for block in attributes.findall("data_block"):
             record = {child.tag: child.text for child in block}
             domain = record.get("domain")
-            custid = record.get("d_custid")
+            custid = record.get("id")
+            email = record.get("email")
+
             if domain and custid:
-                domain_map[domain.lower()] = custid
+                domain_map[domain.lower()] = (custid, email)
 
     return domain_map
 
@@ -145,12 +157,14 @@ def rebuild_nshosted(conn: MySQLConnection) -> None:
     ddl = """
     DROP TABLE IF EXISTS nshosted;
     CREATE TABLE nshosted (
-        domain       VARCHAR(255) NOT NULL,
-        hostname     VARCHAR(255) NOT NULL,
-        customer_id  INT UNSIGNED NULL,
+        domain          VARCHAR(255) NOT NULL,
+        hostname        VARCHAR(255) NOT NULL,
+        customer_id     INT UNSIGNED NULL,
+        customer_email  VARCHAR(255) NULL,
 
         PRIMARY KEY (domain, hostname),
-        KEY idx_customer_id (customer_id)
+        KEY idx_customer_id (customer_id),
+        KEY idx_customer_email (customer_email)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     """
     with conn.cursor() as cursor:
@@ -162,14 +176,15 @@ def rebuild_nshosted(conn: MySQLConnection) -> None:
 
 def insert_pairs(
     conn: MySQLConnection,
-    pairs: List[Tuple[str, str, Optional[str]]],
+    pairs: List[Tuple[str, str, Optional[str], Optional[str]]],
 ) -> None:
     if not pairs:
         return
 
     sql = """
-        INSERT IGNORE INTO nshosted (domain, hostname, customer_id)
-        VALUES (%s, %s, %s)
+        INSERT IGNORE INTO nshosted
+            (domain, hostname, customer_id, customer_email)
+        VALUES (%s, %s, %s, %s)
     """
     with conn.cursor() as cursor:
         cursor.executemany(sql, pairs)
@@ -214,7 +229,7 @@ def iter_domain_pairs(path: str) -> Iterator[Tuple[str, str]]:
 async def process_zones(
     ready_event: asyncio.Event,
     files: List[str],
-    domain_customer_map: Dict[str, str],
+    domain_customer_map: Dict[str, Tuple[str, str]],
     mysql_cfg: MySQLConfig,
 ) -> None:
     await ready_event.wait()
@@ -227,14 +242,19 @@ async def process_zones(
         for path in files:
             print(f"\nProcessing: {path}")
 
-            batch: List[Tuple[str, str, Optional[str]]] = []
+            batch: List[Tuple[str, str, Optional[str], Optional[str]]] = []
 
             for domain, nameserver in iter_domain_pairs(path):
                 if not is_our_nameserver(nameserver):
                     continue
 
-                customer_id = domain_customer_map.get(domain)
-                batch.append((domain, nameserver, customer_id))
+                customer = domain_customer_map.get(domain)
+                if customer:
+                    customer_id, customer_email = customer
+                else:
+                    customer_id, customer_email = None, None
+
+                batch.append((domain, nameserver, customer_id, customer_email))
 
                 if len(batch) >= 10_000:
                     insert_pairs(conn, batch)
@@ -267,7 +287,7 @@ def print_nshosted_summary(conn: MySQLConnection, limit: int = 20) -> None:
                 COUNT(customer_id)       AS with_customer,
                 COUNT(*) - COUNT(customer_id) AS without_customer
             FROM nshosted
-        """
+            """
         )
         stats = cursor.fetchone()
 
@@ -281,26 +301,28 @@ def print_nshosted_summary(conn: MySQLConnection, limit: int = 20) -> None:
         print("\nSample rows:")
         cursor.execute(
             """
-            SELECT domain, hostname, customer_id
+            SELECT domain, hostname, customer_id, customer_email
             FROM nshosted
             ORDER BY domain, hostname
             LIMIT %s
-        """,
+            """,
             (limit,),
         )
         for row in cursor.fetchall():
             print(
                 f"{row['domain']:<35} "
                 f"{row['hostname']:<30} "
-                f"{row['customer_id']}"
+                f"{row['customer_id']:<8} "
+                f"{row['customer_email']}"
             )
+
 
 async def main() -> None:
     config: AppConfig = load_config()
 
     os.makedirs(ZONES_DIR, exist_ok=True)
 
-    print("Loading domain → customer ID mapping")
+    print("Loading domain → customer mapping (ID + email)")
     domain_customer_map = fetch_domain_customer_map(config.plat)
     print(f"Loaded {len(domain_customer_map)} domain mappings")
 

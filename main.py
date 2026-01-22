@@ -34,6 +34,7 @@ OUR_NS_DOMAINS = {
     "inactive.net",
 }
 
+
 @dataclass(frozen=True)
 class CZDSConfig:
     username: str
@@ -60,6 +61,7 @@ class AppConfig:
     czds: CZDSConfig
     mysql: MySQLConfig
     plat: PlatConfig
+
 
 def load_config(path="/etc/dns-audit/config.json") -> AppConfig:
     with open(path, "r", encoding="utf-8") as f:
@@ -104,6 +106,7 @@ def iter_ns_records(path: str) -> Iterator[Tuple[str, str]]:
             if len(p) >= 5 and p[3].upper() == "NS":
                 yield p[0].rstrip(".").lower(), p[4].rstrip(".").lower()
 
+
 def fetch_domain_customer_map(plat: PlatConfig) -> Dict[str, Tuple[int, str]]:
     xml = f"""<?xml version="1.0"?>
     <PLATXML><body><data_block>
@@ -140,16 +143,20 @@ def fetch_domain_customer_map(plat: PlatConfig) -> Dict[str, Tuple[int, str]]:
 
     return out
 
+
 def rebuild_table(conn: MySQLConnection) -> None:
     ddl = """
     DROP TABLE IF EXISTS nshosted;
     CREATE TABLE nshosted (
-        domain          VARCHAR(255) NOT NULL,
-        hostname        VARCHAR(255) NULL,
-        customer_id     INT UNSIGNED NULL,
-        customer_email  VARCHAR(255) NULL,
-        exception       ENUM('NXDOMAIN','NOT OUR SERVERS') NULL,
-        PRIMARY KEY (domain, hostname),
+        id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        domain           VARCHAR(255) NOT NULL,
+        hostname         VARCHAR(255) NULL,
+        customer_id      INT UNSIGNED NULL,
+        customer_email   VARCHAR(255) NULL,
+        exception        ENUM('NXDOMAIN','NOT OUR SERVERS') NULL,
+
+        PRIMARY KEY (id),
+        UNIQUE KEY uniq_domain_host (domain, hostname),
         KEY idx_exception (exception),
         KEY idx_customer (customer_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -159,6 +166,7 @@ def rebuild_table(conn: MySQLConnection) -> None:
             if stmt.strip():
                 c.execute(stmt)
     conn.commit()
+
 
 def insert_rows(conn: MySQLConnection, rows: List[Tuple]) -> None:
     if not rows:
@@ -171,6 +179,7 @@ def insert_rows(conn: MySQLConnection, rows: List[Tuple]) -> None:
     with conn.cursor() as c:
         c.executemany(sql, rows)
     conn.commit()
+
 
 async def process_zones(
     ready: asyncio.Event,
@@ -214,6 +223,7 @@ async def process_zones(
 
     insert_rows(conn, batch)
     conn.close()
+
 
 async def main() -> None:
     cfg = load_config()

@@ -195,11 +195,14 @@ def is_our_nameserver(nameserver: str) -> bool:
     if "europa" in nameserver:
         return False
 
-    for suffix in OUR_NS_DOMAINS:
-        if nameserver.endswith(suffix):
-            return True
-    return False
+    labels = nameserver.split(".")
 
+    for suffix in OUR_NS_DOMAINS:
+        suffix_labels = suffix.split(".")
+        if labels[-len(suffix_labels):] == suffix_labels:
+            return True
+
+    return False
 
 def open_zone(path: str) -> TextIO:
     if path.endswith(".gz"):

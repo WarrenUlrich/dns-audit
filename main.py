@@ -180,7 +180,6 @@ def insert_rows(conn: MySQLConnection, rows: List[Tuple]) -> None:
         c.executemany(sql, rows)
     conn.commit()
 
-
 async def process_zones(
     ready: asyncio.Event,
     zone_files: List[str],
@@ -192,30 +191,63 @@ async def process_zones(
     conn = mysql_conn(mysql_cfg)
     rebuild_table(conn)
 
-    domain_ns: Dict[str, Set[str]] = defaultdict(set)
-
-    for path in zone_files:
-        for d, ns in iter_ns_records(path):
-            domain_ns[d].add(ns)
-        os.remove(path)
-
+    wanted = domain_map
     batch: List[Tuple] = []
 
-    for domain, (cid, email) in domain_map.items():
-        ns_set = domain_ns.get(domain)
+    def flush_domain(domain: str, ns_set: Set[str]) -> None:
+        nonlocal batch
+
+        cid, email = wanted[domain]
 
         if not ns_set:
             batch.append((domain, None, cid, email, "NXDOMAIN"))
-            continue
+            return
 
-        if not any(is_our_nameserver(ns) for ns in ns_set):
+        ours = [ns for ns in ns_set if is_our_nameserver(ns)]
+
+        if not ours:
             for ns in ns_set:
                 batch.append((domain, ns, cid, email, "NOT OUR SERVERS"))
-            continue
+            return
 
-        for ns in ns_set:
-            if is_our_nameserver(ns):
-                batch.append((domain, ns, cid, email, None))
+        for ns in ours:
+            batch.append((domain, ns, cid, email, None))
+
+    current_domain: Optional[str] = None
+    current_ns: Set[str] = set()
+    seen_domains: Set[str] = set()
+
+    for path in zone_files:
+        for domain, ns in iter_ns_records(path):
+            if domain not in wanted:
+                continue
+
+            if current_domain is None:
+                current_domain = domain
+
+            if domain != current_domain:
+                flush_domain(current_domain, current_ns)
+                seen_domains.add(current_domain)
+
+                current_domain = domain
+                current_ns.clear()
+
+                if len(batch) >= 10_000:
+                    insert_rows(conn, batch)
+                    batch.clear()
+
+            current_ns.add(ns)
+
+        os.remove(path)
+
+    if current_domain is not None:
+        flush_domain(current_domain, current_ns)
+        seen_domains.add(current_domain)
+
+    # Domains never seen in the zone → NXDOMAIN
+    for domain, (cid, email) in wanted.items():
+        if domain not in seen_domains:
+            batch.append((domain, None, cid, email, "NXDOMAIN"))
 
         if len(batch) >= 10_000:
             insert_rows(conn, batch)
@@ -223,6 +255,7 @@ async def process_zones(
 
     insert_rows(conn, batch)
     conn.close()
+
 
 
 async def main() -> None:
